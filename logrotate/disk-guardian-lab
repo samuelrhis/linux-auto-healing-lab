@@ -1,0 +1,11 @@
+/mnt/disk-lab/app-logs/application.log {
+    su samuelrhis samuelrhis
+    size 50K
+    rotate 5
+    compress
+    dateext
+    dateformat -%Y%m%d-%H%M%S
+    create 0644 samuelrhis samuelrhis
+    missingok
+    notifempty
+}

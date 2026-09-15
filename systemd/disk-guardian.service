@@ -1,0 +1,8 @@
+[Unit]
+Description=Linux Disk Guardian
+After=local-fs.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/samuelrhis/linux-auto-healing-lab
+ExecStart=/home/samuelrhis/linux-auto-healing-lab/guardian/disk-guardian.sh
