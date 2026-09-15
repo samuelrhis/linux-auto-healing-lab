@@ -15,7 +15,7 @@ do
     TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S')
 
     {
-        for i in {1..20000}
+        for _  in {1..20000}
         do
             echo "$TIMESTAMP [INFO] Processing application request successfully"
             echo "$TIMESTAMP [WARN] Response time above expected threshold"
