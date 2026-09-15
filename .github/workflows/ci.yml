@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  shellcheck:
+    name: ShellCheck
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install ShellCheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+
+      - name: Validate Bash scripts
+        run: |
+          shellcheck guardian/disk-guardian.sh
+          shellcheck simulator/generate-load.sh
+
+  bash-syntax:
+    name: Bash syntax validation
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Validate script syntax
+        run: |
+          bash -n guardian/disk-guardian.sh
+          bash -n simulator/generate-load.sh
