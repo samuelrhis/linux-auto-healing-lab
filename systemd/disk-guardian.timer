@@ -1,9 +1,10 @@
 [Unit]
-Description=Run Linux Disk Guardian every minute
+Description=Run Linux Disk Guardian every 15 seconds
 
 [Timer]
-OnBootSec=1min
-OnUnitActiveSec=1min
+OnBootSec=15s
+OnUnitInactiveSec=15s
+AccurancySec=1s
 Persistent=true
 
 [Install]

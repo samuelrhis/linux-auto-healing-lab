@@ -4,16 +4,6 @@ set -u
 
 LOCK_FILE="/run/disk-guardian.lock"
 
-if ! exec 200>"$LOCK_FILE"; then
-    echo "[ERROR] Unable to create lock file: $LOCK_FILE"
-    exit 1
-fi
-
-if ! flock -n 200; then
-    echo "[INFO] Another Disk Guardian instance is already running."
-    exit 0
-fi
-
 TARGET="/mnt/disk-lab"
 APP_LOG="$TARGET/app-logs/application.log"
 LOGROTATE_CONFIG="/etc/logrotate.d/disk-guardian-lab"
@@ -25,23 +15,41 @@ CRITICAL_THRESHOLD=85
 
 GROWTH_INTERVAL=10
 GROWTH_THRESHOLD_MB=10
+PREEMPTIVE_SECONDS=60
 RECENT_LINES=50000
 
+LOG_GROWTH_MB=0
+GROWTH_BYTES=0
+LOG_ANOMALY=false
+GROWTH_MEASURED=false
+ETA_SECONDS=-1
+
+if ! exec 200>"$LOCK_FILE"; then
+    echo "[ERROR] Unable to create lock file: $LOCK_FILE"
+    exit 1
+fi
+
+if ! flock -n 200; then
+    echo "[INFO] Another Disk Guardian instance is already running."
+    exit 0
+fi
 
 log_message() {
-    LEVEL="$1"
-    MESSAGE="$2"
+    local level="$1"
+    local message="$2"
+    local log_line
 
-    LOG_LINE="$(date '+%Y-%m-%d %H:%M:%S') [$LEVEL] $MESSAGE"
-
-    echo "$LOG_LINE" | tee -a "$GUARDIAN_LOG"
+    log_line="$(date '+%Y-%m-%d %H:%M:%S') [$level] $message"
+    echo "$log_line" | tee -a "$GUARDIAN_LOG"
 }
-
 
 get_usage() {
     df -P "$TARGET" | awk 'NR==2 {gsub("%","",$5); print $5}'
 }
 
+get_free_bytes() {
+    df -PB1 "$TARGET" | awk 'NR==2 {print $4}'
+}
 
 get_log_size_bytes() {
     if [ -f "$APP_LOG" ]; then
@@ -51,30 +59,34 @@ get_log_size_bytes() {
     fi
 }
 
-
 check_log_growth() {
+    local initial_size
+    local final_size
+
     if [ ! -f "$APP_LOG" ]; then
         LOG_GROWTH_MB=0
+        GROWTH_BYTES=0
         LOG_ANOMALY=false
+        GROWTH_MEASURED=true
         return
     fi
 
-    INITIAL_SIZE=$(get_log_size_bytes)
+    initial_size=$(get_log_size_bytes)
 
-    log_message "INFO" \
-        "Monitoring application log growth for ${GROWTH_INTERVAL}s"
+    log_message "INFO" "Monitoring application log growth for ${GROWTH_INTERVAL}s"
 
     sleep "$GROWTH_INTERVAL"
 
-    FINAL_SIZE=$(get_log_size_bytes)
+    final_size=$(get_log_size_bytes)
 
-    GROWTH_BYTES=$((FINAL_SIZE - INITIAL_SIZE))
+    GROWTH_BYTES=$((final_size - initial_size))
 
     if [ "$GROWTH_BYTES" -lt 0 ]; then
         GROWTH_BYTES=0
     fi
 
     LOG_GROWTH_MB=$((GROWTH_BYTES / 1024 / 1024))
+    GROWTH_MEASURED=true
 
     if [ "$LOG_GROWTH_MB" -ge "$GROWTH_THRESHOLD_MB" ]; then
         LOG_ANOMALY=true
@@ -83,8 +95,34 @@ check_log_growth() {
     fi
 }
 
+calculate_eta_to_full() {
+    local free_bytes
+    local growth_per_second
+
+    ETA_SECONDS=-1
+
+    if [ "$GROWTH_MEASURED" != true ] || [ "$GROWTH_BYTES" -le 0 ]; then
+        return
+    fi
+
+    growth_per_second=$((GROWTH_BYTES / GROWTH_INTERVAL))
+
+    if [ "$growth_per_second" -le 0 ]; then
+        return
+    fi
+
+    free_bytes=$(get_free_bytes)
+    ETA_SECONDS=$((free_bytes / growth_per_second))
+}
 
 collect_evidence() {
+    local log_size
+    local error_count
+    local warn_count
+    local process_pid
+    local process_user
+    local process_command
+
     log_message "INFO" "Collecting incident evidence"
 
     echo
@@ -93,85 +131,113 @@ collect_evidence() {
     if [ ! -f "$APP_LOG" ]; then
         echo "Application log not found."
         echo "-------------------------------"
+        echo
 
-        log_message "WARNING" \
-            "Application log was not found during evidence collection"
-
+        log_message "WARNING" "Application log was not found during evidence collection"
         return
     fi
 
-    LOG_SIZE=$(du -h "$APP_LOG" | awk '{print $1}')
+    log_size=$(du -h "$APP_LOG" | awk '{print $1}')
 
-    ERROR_COUNT=$(
+    error_count=$(
         tail -n "$RECENT_LINES" "$APP_LOG" |
         grep -c "\[ERROR\]" || true
     )
 
-    WARN_COUNT=$(
+    warn_count=$(
         tail -n "$RECENT_LINES" "$APP_LOG" |
         grep -c "\[WARN\]" || true
     )
 
     echo "Log file: $APP_LOG"
-    echo "Log size: $LOG_SIZE"
-    echo "Log growth: ${LOG_GROWTH_MB} MB in ${GROWTH_INTERVAL}s"
-    echo "ERROR entries in last ${RECENT_LINES} lines: $ERROR_COUNT"
-    echo "WARN entries in last ${RECENT_LINES} lines: $WARN_COUNT"
+    echo "Log size: $log_size"
+
+    if [ "$GROWTH_MEASURED" = true ]; then
+        echo "Log growth: ${LOG_GROWTH_MB} MB in ${GROWTH_INTERVAL}s"
+
+        if [ "$ETA_SECONDS" -ge 0 ]; then
+            echo "Estimated time to filesystem exhaustion: ~${ETA_SECONDS}s"
+        fi
+    else
+        echo "Log growth: not measured (immediate remediation priority)"
+    fi
+
+    echo "ERROR entries in last ${RECENT_LINES} lines: $error_count"
+    echo "WARN entries in last ${RECENT_LINES} lines: $warn_count"
 
     echo
     echo "Process using log:"
 
-    PROCESS_PID=$(lsof -t "$APP_LOG" 2>/dev/null | head -n 1 || true)
+    process_pid=$(lsof -t "$APP_LOG" 2>/dev/null | head -n 1 || true)
 
-    if [ -n "$PROCESS_PID" ]; then
-        PROCESS_USER=$(
-            ps -p "$PROCESS_PID" -o user= |
-            xargs
-        )
+    if [ -n "$process_pid" ]; then
+        process_user=$(ps -p "$process_pid" -o user= | xargs)
+        process_command=$(ps -p "$process_pid" -o args=)
 
-        PROCESS_COMMAND=$(
-            ps -p "$PROCESS_PID" -o args=
-        )
+        echo "PID: $process_pid"
+        echo "User: $process_user"
+        echo "Command: $process_command"
 
-        echo "PID: $PROCESS_PID"
-        echo "User: $PROCESS_USER"
-        echo "Command: $PROCESS_COMMAND"
-
-        log_message "INFO" \
-            "Application log is being used by PID $PROCESS_PID ($PROCESS_COMMAND)"
+        log_message "INFO" "Application log is being used by PID $process_pid ($process_command)"
     else
         echo "No process currently has the log file open."
-
-        log_message "INFO" \
-            "No process currently has the application log open"
+        log_message "INFO" "No process currently has the application log open"
     fi
 
     echo
     echo "Recent relevant events:"
 
-    grep -E "\[ERROR\]|\[WARN\]" "$APP_LOG" |
+    tail -n "$RECENT_LINES" "$APP_LOG" |
+        grep -E "\[ERROR\]|\[WARN\]" |
         tail -n 10 || true
 
     echo "-------------------------------"
     echo
 
-    log_message "INFO" \
-        "Evidence summary: size=$LOG_SIZE growth=${LOG_GROWTH_MB}MB errors=$ERROR_COUNT warnings=$WARN_COUNT"
+    log_message "INFO" "Evidence summary: size=$log_size growth=${LOG_GROWTH_MB}MB errors=$error_count warnings=$warn_count"
 }
-
 
 run_log_rotation() {
-    ACTION_NAME="$1"
+    local action_name="$1"
 
-    log_message "ACTION" "$ACTION_NAME"
-
-    if logrotate -f "$LOGROTATE_CONFIG"; then
-        return 0
-    else
-        return 1
-    fi
+    log_message "ACTION" "$action_name"
+    logrotate -f "$LOGROTATE_CONFIG"
 }
 
+perform_remediation() {
+    local remediation_type="$1"
+    local before_usage
+    local after_usage
+
+    before_usage=$(get_usage)
+
+    collect_evidence
+
+    if run_log_rotation "$remediation_type"; then
+        after_usage=$(get_usage)
+
+        log_message "SUCCESS" "Log rotation completed"
+        log_message "INFO" "Disk usage changed from ${before_usage}% to ${after_usage}%"
+
+        if [ "$after_usage" -ge "$CRITICAL_THRESHOLD" ]; then
+            log_message "ALERT" "Disk usage remains critical after remediation"
+            log_message "ACTION_REQUIRED" "Manual investigation is required"
+            return 2
+        fi
+
+        if [ "$after_usage" -ge "$REMEDIATION_THRESHOLD" ]; then
+            log_message "WARNING" "Disk usage remains above remediation threshold"
+            return 0
+        fi
+
+        log_message "RESOLVED" "Disk usage returned to a safe level"
+        return 0
+    fi
+
+    log_message "ERROR" "Log rotation failed"
+    log_message "ACTION_REQUIRED" "Manual investigation is required"
+    return 1
+}
 
 log_message "INFO" "Disk Guardian execution started"
 
@@ -187,130 +253,89 @@ echo
 
 log_message "INFO" "Filesystem usage is ${USAGE}%"
 
-check_log_growth
+if [ "$USAGE" -ge "$CRITICAL_THRESHOLD" ]; then
+    log_message "CRITICAL" "Disk usage is above ${CRITICAL_THRESHOLD}%"
 
-if [ "$LOG_ANOMALY" = true ]; then
-    log_message "ANOMALY" \
-        "Abnormal log growth detected: ${LOG_GROWTH_MB} MB in ${GROWTH_INTERVAL}s"
+    perform_remediation "Attempting emergency log rotation"
+    RESULT=$?
+
+    log_message "INFO" "Disk Guardian execution finished"
+    exit "$RESULT"
 fi
 
+if [ "$USAGE" -ge "$REMEDIATION_THRESHOLD" ]; then
+    log_message "REMEDIATION" "Disk usage is above ${REMEDIATION_THRESHOLD}%"
+
+    perform_remediation "Triggering preventive log rotation"
+    RESULT=$?
+
+    log_message "INFO" "Disk Guardian execution finished"
+    exit "$RESULT"
+fi
+
+check_log_growth
+
+USAGE=$(get_usage)
+
+if [ "$LOG_ANOMALY" = true ]; then
+    log_message "ANOMALY" "Abnormal log growth detected: ${LOG_GROWTH_MB} MB in ${GROWTH_INTERVAL}s"
+fi
 
 if [ "$USAGE" -ge "$CRITICAL_THRESHOLD" ]; then
+    log_message "CRITICAL" "Disk usage reached ${USAGE}% during growth analysis"
 
-    log_message "CRITICAL" \
-        "Disk usage is above ${CRITICAL_THRESHOLD}%"
+    perform_remediation "Attempting emergency log rotation"
+    RESULT=$?
 
-    collect_evidence
+    log_message "INFO" "Disk Guardian execution finished"
+    exit "$RESULT"
+fi
 
-    BEFORE_USAGE="$USAGE"
+if [ "$USAGE" -ge "$REMEDIATION_THRESHOLD" ]; then
+    log_message "REMEDIATION" "Disk usage reached ${USAGE}% during growth analysis"
 
-    if run_log_rotation "Attempting emergency log rotation"; then
+    perform_remediation "Triggering preventive log rotation"
+    RESULT=$?
 
-        AFTER_USAGE=$(get_usage)
+    log_message "INFO" "Disk Guardian execution finished"
+    exit "$RESULT"
+fi
 
-        log_message "SUCCESS" \
-            "Emergency log rotation completed"
+if [ "$LOG_ANOMALY" = true ]; then
+    calculate_eta_to_full
 
-        log_message "INFO" \
-            "Disk usage changed from ${BEFORE_USAGE}% to ${AFTER_USAGE}%"
-
-        if [ "$AFTER_USAGE" -ge "$CRITICAL_THRESHOLD" ]; then
-
-            log_message "ALERT" \
-                "Disk usage remains critical after remediation"
-
-            log_message "ACTION_REQUIRED" \
-                "Manual investigation is required"
-
-            exit 2
-
-        else
-
-            log_message "RESOLVED" \
-                "Disk usage returned below critical threshold"
-        fi
-
-    else
-
-        log_message "ERROR" \
-            "Emergency log rotation failed"
-
-        log_message "ACTION_REQUIRED" \
-            "Manual investigation is required"
-
-        exit 1
+    if [ "$ETA_SECONDS" -ge 0 ]; then
+        log_message "PREDICTION" "Estimated time to filesystem exhaustion: ~${ETA_SECONDS}s"
     fi
 
+    if [ "$ETA_SECONDS" -ge 0 ] && [ "$ETA_SECONDS" -le "$PREEMPTIVE_SECONDS" ]; then
+        log_message "PREEMPTIVE" "Fast log growth may exhaust the filesystem within ${PREEMPTIVE_SECONDS}s"
 
-elif [ "$USAGE" -ge "$REMEDIATION_THRESHOLD" ]; then
+        perform_remediation "Triggering preemptive log rotation"
+        RESULT=$?
 
-    log_message "REMEDIATION" \
-        "Disk usage is above ${REMEDIATION_THRESHOLD}%"
-
-    collect_evidence
-
-    BEFORE_USAGE="$USAGE"
-
-    if run_log_rotation "Triggering preventive log rotation"; then
-
-        AFTER_USAGE=$(get_usage)
-
-        log_message "SUCCESS" \
-            "Preventive log rotation completed"
-
-        log_message "INFO" \
-            "Disk usage changed from ${BEFORE_USAGE}% to ${AFTER_USAGE}%"
-
-        if [ "$AFTER_USAGE" -ge "$REMEDIATION_THRESHOLD" ]; then
-
-            log_message "WARNING" \
-                "Disk usage remains above remediation threshold"
-
-        else
-
-            log_message "RESOLVED" \
-                "Disk usage returned to a safe level"
-        fi
-
-    else
-
-        log_message "ERROR" \
-            "Preventive log rotation failed"
-
-        exit 1
+        log_message "INFO" "Disk Guardian execution finished"
+        exit "$RESULT"
     fi
+fi
 
-
-elif [ "$USAGE" -ge "$WARNING_THRESHOLD" ]; then
-
-    log_message "WARNING" \
-        "Disk usage is above ${WARNING_THRESHOLD}%"
+if [ "$USAGE" -ge "$WARNING_THRESHOLD" ]; then
+    log_message "WARNING" "Disk usage is above ${WARNING_THRESHOLD}%"
 
     collect_evidence
 
-    log_message "INFO" \
-        "No automatic remediation triggered at warning level"
-
+    log_message "INFO" "No automatic remediation triggered at warning level"
 
 elif [ "$LOG_ANOMALY" = true ]; then
-
-    log_message "WARNING" \
-        "Log growth anomaly detected while disk usage is still normal"
+    log_message "WARNING" "Log growth anomaly detected while disk usage is still normal"
 
     collect_evidence
 
-    log_message "INFO" \
-        "No automatic remediation triggered"
-
-    log_message "INFO" \
-        "Early investigation is recommended"
-
+    log_message "INFO" "No automatic remediation triggered"
+    log_message "INFO" "Early investigation is recommended"
 
 else
-
-    log_message "OK" \
-        "Disk usage and log growth are normal"
-
+    log_message "OK" "Disk usage and log growth are normal"
 fi
 
 log_message "INFO" "Disk Guardian execution finished"
